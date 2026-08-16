@@ -3,7 +3,7 @@
 // Shapes are plain absolutely-positioned Views (no SVG/Skia — R2 ban).
 // Geometry is NEVER used to compute areas/lengths/values (perspective drawings).
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { View, Text, StyleSheet, Pressable, TextInput, ScrollView, Modal } from "react-native";
+import { View, Text, StyleSheet, Pressable, TextInput, ScrollView, Modal, Platform, useWindowDimensions } from "react-native";
 import { Image } from "expo-image";
 import { Ionicons } from "@expo/vector-icons";
 import { colors, spacing, font, radius, elementStatusColor } from "@/src/theme/tokens";
@@ -50,6 +50,10 @@ function geomSnapshot(el: any) {
 export function GeometryEditor({ view, elements, types, reload }: { view: any; elements: any[]; types: any[]; reload: () => void }) {
   const { t, lang } = useI18n();
   const toast = useToast();
+  const { width: winW } = useWindowDimensions();
+  // BLOK 2: compact toolbar (icon-only) below 1500px — icon set fits fully even at
+  // 820px (tablet portrait); horizontal scroll stays as a safety net
+  const compact = winW < 1500;
   const aspect = view.szerokosc && view.wysokosc ? view.wysokosc / view.szerokosc : 0.75;
   const W = BASE_W, H = BASE_W * aspect;
 
@@ -80,6 +84,8 @@ export function GeometryEditor({ view, elements, types, reload }: { view: any; e
 
   const stageRef = useRef<any>(null);
   const stageSize = useRef({ w: 800, h: 600 });
+  const stagePos = useRef({ px: 0, py: 0 });
+  const pinch = useRef<null | { d0: number; s0: number; mid: { x: number; y: number }; tx0: number; ty0: number }>(null);
   const hist = useRef<{ past: HistOp[]; future: HistOp[] }>({ past: [], future: [] });
   const drag = useRef<null | { x: number; y: number; orig: Map<string, Geom> }>(null);
   const resize = useRef<null | { id: string; corner: number; orig: Geom }>(null);
@@ -106,12 +112,18 @@ export function GeometryEditor({ view, elements, types, reload }: { view: any; e
   }, [snapOn, stepRel]);
 
   const toRel = useCallback((cx: number, cy: number) => {
-    const node = stageRef.current as HTMLElement | null;
-    if (!node || !(node as any).getBoundingClientRect) return { x: 0, y: 0 };
-    const r = (node as any).getBoundingClientRect();
-    stageSize.current = { w: r.width, h: r.height };
+    if (Platform.OS === "web") {
+      const node = stageRef.current as HTMLElement | null;
+      if (!node || !(node as any).getBoundingClientRect) return { x: 0, y: 0 };
+      const r = (node as any).getBoundingClientRect();
+      stageSize.current = { w: r.width, h: r.height };
+      const { s, tx, ty } = trRef.current;
+      return { x: (cx - r.left - tx) / (s * W), y: (cy - r.top - ty) / (s * H) };
+    }
+    // native (tablet): stage position measured via measureInWindow on layout
+    const { px, py } = stagePos.current;
     const { s, tx, ty } = trRef.current;
-    return { x: (cx - r.left - tx) / (s * W), y: (cy - r.top - ty) / (s * H) };
+    return { x: (cx - px - tx) / (s * W), y: (cy - py - ty) / (s * H) };
   }, [W, H]);
 
   const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
@@ -122,7 +134,8 @@ export function GeometryEditor({ view, elements, types, reload }: { view: any; e
     for (let i = list.length - 1; i >= 0; i--) {
       const g = toGeom(list[i]);
       if (g.punkt) {
-        if (Math.abs(p.x - g.x) * W * s < 12 && Math.abs(p.y - g.y) * H * s < 12) return list[i];
+        const tol = Platform.OS === "web" ? 12 : 24; // ≥48dp touch target on tablets
+        if (Math.abs(p.x - g.x) * W * s < tol && Math.abs(p.y - g.y) * H * s < tol) return list[i];
       } else if (p.x >= g.x && p.x <= g.x + g.w && p.y >= g.y && p.y <= g.y + g.h) return list[i];
     }
     return null;
@@ -141,8 +154,9 @@ export function GeometryEditor({ view, elements, types, reload }: { view: any; e
       { x: g.x + g.w, y: g.y + g.h }, { x: g.x, y: g.y + g.h },
     ];
     for (let i = 0; i < 4; i++) {
-      // screen-pixel tolerance (10px) — independent of zoom and aspect ratio
-      if (Math.abs(p.x - corners[i].x) * W * s < 10 && Math.abs(p.y - corners[i].y) * H * s < 10) {
+      // screen-pixel tolerance — 10px mouse / 24px touch (≥48dp target)
+      const tol = Platform.OS === "web" ? 10 : 24;
+      if (Math.abs(p.x - corners[i].x) * W * s < tol && Math.abs(p.y - corners[i].y) * H * s < tol) {
         return { id: el.id, corner: i, orig: g };
       }
     }
@@ -302,13 +316,117 @@ export function GeometryEditor({ view, elements, types, reload }: { view: any; e
     openCreateForm({ ...g, x: clamp01(g.x + 0.02), y: clamp01(g.y + 0.02) });
   };
 
+  // ---- shared pointer core (mouse on web, touch on tablets) ----------------
+  const pointerDown = (p0: { x: number; y: number }, ctrl: boolean) => {
+    const p = snapV(clamp01(p0.x), clamp01(p0.y));
+    if (toolRef.current === "punkt") { openCreateForm({ x: p.x, y: p.y, w: 0, h: 0, punkt: true }); return; }
+    if (toolRef.current === "prostokat") {
+      if (!drawRef.current) { setDrawStart(p); }
+      else {
+        const a = drawRef.current; let bx = p.x, by = p.y;
+        if (shift.current) {
+          const dxp = (bx - a.x) * W, dyp = (by - a.y) * H;
+          const m = Math.max(Math.abs(dxp), Math.abs(dyp));
+          bx = a.x + Math.sign(dxp || 1) * (m / W); by = a.y + Math.sign(dyp || 1) * (m / H);
+        }
+        const g = { x: Math.min(a.x, bx), y: Math.min(a.y, by), w: Math.abs(bx - a.x), h: Math.abs(by - a.y), punkt: false };
+        setDrawStart(null);
+        if (g.w > 0.002 && g.h > 0.002) openCreateForm(g);
+      }
+      return;
+    }
+    const h = hitHandle(p0);
+    if (h) { resize.current = h; return; }
+    const shp = hitShape(p0);
+    if (shp) {
+      let nextSel = { ...selRef.current };
+      if (ctrl) nextSel[shp.id] = !nextSel[shp.id];
+      else if (!nextSel[shp.id]) nextSel = { [shp.id]: true };
+      setSel(nextSel);
+      const orig = new Map<string, Geom>();
+      elsRef.current.forEach((el) => { if (nextSel[el.id]) orig.set(el.id, toGeom(el)); });
+      drag.current = { x: p0.x, y: p0.y, orig };
+    } else {
+      if (!ctrl) setSel({});
+      setMarquee({ x0: p0.x, y0: p0.y, x1: p0.x, y1: p0.y });
+    }
+  };
+
+  const pointerMove = (p: { x: number; y: number }) => {
+    setMouse({ x: p.x, y: p.y });
+    if (resize.current) {
+      const r = resize.current; const o = r.orig;
+      const sp = snapV(clamp01(p.x), clamp01(p.y));
+      let x1 = o.x, y1 = o.y, x2 = o.x + o.w, y2 = o.y + o.h;
+      if (r.corner === 0) { x1 = sp.x; y1 = sp.y; } if (r.corner === 1) { x2 = sp.x; y1 = sp.y; }
+      if (r.corner === 2) { x2 = sp.x; y2 = sp.y; } if (r.corner === 3) { x1 = sp.x; y2 = sp.y; }
+      setResizePrev({ id: r.id, g: { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1), punkt: false } });
+      return;
+    }
+    if (drag.current) {
+      let dx = p.x - drag.current.x, dy = p.y - drag.current.y;
+      if (snapOn) { const { sx, sy } = stepRel(); dx = Math.round(dx / sx) * sx; dy = Math.round(dy / sy) * sy; }
+      setDragDelta({ dx, dy });
+      return;
+    }
+    if (marqueeRef.current) setMarquee((m) => (m ? { ...m, x1: p.x, y1: p.y } : m));
+  };
+
+  const pointerUp = () => {
+    if (resize.current) {
+      const r = resize.current; resize.current = null;
+      setResizePrev((prev) => {
+        if (prev && (prev.g.w > 0.002 && prev.g.h > 0.002)) {
+          const el = elsRef.current.find((e) => e.id === r.id);
+          if (el) commitGeom([geomSnapshot(el)], [{ id: r.id, ...geomPayload(prev.g) }]);
+        }
+        return null;
+      });
+      return;
+    }
+    if (drag.current) {
+      const d = drag.current; drag.current = null;
+      setDragDelta((delta) => {
+        if (delta && (Math.abs(delta.dx) > 0.0005 || Math.abs(delta.dy) > 0.0005)) {
+          const before: any[] = []; const after: any[] = [];
+          d.orig.forEach((g, id) => {
+            const el = elsRef.current.find((e) => e.id === id);
+            if (!el) return;
+            before.push(geomSnapshot(el));
+            after.push({ id, ...geomPayload({ ...g, x: clamp01(g.x + delta.dx), y: clamp01(g.y + delta.dy) }) });
+          });
+          if (after.length) commitGeom(before, after);
+        }
+        return null;
+      });
+      return;
+    }
+    if (marqueeRef.current) {
+      const m = marqueeRef.current; setMarquee(null);
+      const x1 = Math.min(m.x0, m.x1), x2 = Math.max(m.x0, m.x1);
+      const y1 = Math.min(m.y0, m.y1), y2 = Math.max(m.y0, m.y1);
+      if (x2 - x1 > 0.003 || y2 - y1 > 0.003) {
+        setSel((prev) => {
+          const next = { ...prev };
+          elsRef.current.forEach((el) => {
+            const g = toGeom(el);
+            const cx = g.punkt ? g.x : g.x + g.w / 2, cy = g.punkt ? g.y : g.y + g.h / 2;
+            if (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2) next[el.id] = true;
+          });
+          return next;
+        });
+      }
+    }
+  };
+
   // Listeners are bound once — expose ALWAYS-FRESH callbacks through a ref so
   // keyboard/mouse handlers never act on stale state (fixed after E2E audit).
-  const actions = useRef({ copySel, pasteClip, undo, redo, commitGeom });
-  actions.current = { copySel, pasteClip, undo, redo, commitGeom };
+  const actions = useRef({ copySel, pasteClip, undo, redo, commitGeom, pointerDown, pointerMove, pointerUp });
+  actions.current = { copySel, pasteClip, undo, redo, commitGeom, pointerDown, pointerMove, pointerUp };
 
   // ---- global mouse/keyboard listeners ------------------------------------
   useEffect(() => {
+    if (Platform.OS !== "web") return; // DOM listeners exist only on web
     const node = stageRef.current as any;
     if (!node) return;
 
@@ -322,113 +440,20 @@ export function GeometryEditor({ view, elements, types, reload }: { view: any; e
       // Prevent native <img> drag-and-drop / text selection from hijacking the
       // mouse stream (browser cancels mousemove/mouseup once dragstart fires).
       e.preventDefault();
-      const p0 = toRel(e.clientX, e.clientY);
-      const p = snapV(clamp01(p0.x), clamp01(p0.y));
-      if (toolRef.current === "punkt") { openCreateForm({ x: p.x, y: p.y, w: 0, h: 0, punkt: true }); return; }
-      if (toolRef.current === "prostokat") {
-        if (!drawRef.current) { setDrawStart(p); }
-        else {
-          const a = drawRef.current; let bx = p.x, by = p.y;
-          if (shift.current) { // square in image px space
-            const dxp = (bx - a.x) * W, dyp = (by - a.y) * H;
-            const m = Math.max(Math.abs(dxp), Math.abs(dyp));
-            bx = a.x + Math.sign(dxp || 1) * (m / W); by = a.y + Math.sign(dyp || 1) * (m / H);
-          }
-          const g = { x: Math.min(a.x, bx), y: Math.min(a.y, by), w: Math.abs(bx - a.x), h: Math.abs(by - a.y), punkt: false };
-          setDrawStart(null);
-          if (g.w > 0.002 && g.h > 0.002) openCreateForm(g);
-        }
-        return;
-      }
-      // select tool
-      const h = hitHandle(p0);
-      if (h) { resize.current = h; return; }
-      const shp = hitShape(p0);
-      if (shp) {
-        let nextSel = { ...selRef.current };
-        if (e.ctrlKey || e.metaKey) nextSel[shp.id] = !nextSel[shp.id];
-        else if (!nextSel[shp.id]) nextSel = { [shp.id]: true };
-        setSel(nextSel);
-        const orig = new Map<string, Geom>();
-        elsRef.current.forEach((el) => { if (nextSel[el.id]) orig.set(el.id, toGeom(el)); });
-        drag.current = { x: p0.x, y: p0.y, orig };
-      } else {
-        if (!(e.ctrlKey || e.metaKey)) setSel({});
-        setMarquee({ x0: p0.x, y0: p0.y, x1: p0.x, y1: p0.y });
-      }
+      actions.current.pointerDown(toRel(e.clientX, e.clientY), e.ctrlKey || e.metaKey);
     };
 
     const onMove = (e: MouseEvent) => {
-      const p = toRel(e.clientX, e.clientY);
-      setMouse({ x: p.x, y: p.y });
       if (pan.current) {
         setTr((tr0) => ({ ...tr0, tx: pan.current!.tx + (e.clientX - pan.current!.x), ty: pan.current!.ty + (e.clientY - pan.current!.y) }));
         return;
       }
-      if (resize.current) {
-        const r = resize.current; const o = r.orig;
-        const sp = snapV(clamp01(p.x), clamp01(p.y));
-        let x1 = o.x, y1 = o.y, x2 = o.x + o.w, y2 = o.y + o.h;
-        if (r.corner === 0) { x1 = sp.x; y1 = sp.y; } if (r.corner === 1) { x2 = sp.x; y1 = sp.y; }
-        if (r.corner === 2) { x2 = sp.x; y2 = sp.y; } if (r.corner === 3) { x1 = sp.x; y2 = sp.y; }
-        setResizePrev({ id: r.id, g: { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1), punkt: false } });
-        return;
-      }
-      if (drag.current) {
-        let dx = p.x - drag.current.x, dy = p.y - drag.current.y;
-        if (snapOn) { const { sx, sy } = stepRel(); dx = Math.round(dx / sx) * sx; dy = Math.round(dy / sy) * sy; }
-        setDragDelta({ dx, dy });
-        return;
-      }
-      if (marqueeRef.current) setMarquee((m) => (m ? { ...m, x1: p.x, y1: p.y } : m));
+      actions.current.pointerMove(toRel(e.clientX, e.clientY));
     };
 
     const onUp = () => {
       pan.current = null;
-      if (resize.current) {
-        const r = resize.current; resize.current = null;
-        setResizePrev((prev) => {
-          if (prev && (prev.g.w > 0.002 && prev.g.h > 0.002)) {
-            const el = elsRef.current.find((e) => e.id === r.id);
-            if (el) commitGeom([geomSnapshot(el)], [{ id: r.id, ...geomPayload(prev.g) }]);
-          }
-          return null;
-        });
-        return;
-      }
-      if (drag.current) {
-        const d = drag.current; drag.current = null;
-        setDragDelta((delta) => {
-          if (delta && (Math.abs(delta.dx) > 0.0005 || Math.abs(delta.dy) > 0.0005)) {
-            const before: any[] = []; const after: any[] = [];
-            d.orig.forEach((g, id) => {
-              const el = elsRef.current.find((e) => e.id === id);
-              if (!el) return;
-              before.push(geomSnapshot(el));
-              after.push({ id, ...geomPayload({ ...g, x: clamp01(g.x + delta.dx), y: clamp01(g.y + delta.dy) }) });
-            });
-            if (after.length) commitGeom(before, after);
-          }
-          return null;
-        });
-        return;
-      }
-      if (marqueeRef.current) {
-        const m = marqueeRef.current; setMarquee(null);
-        const x1 = Math.min(m.x0, m.x1), x2 = Math.max(m.x0, m.x1);
-        const y1 = Math.min(m.y0, m.y1), y2 = Math.max(m.y0, m.y1);
-        if (x2 - x1 > 0.003 || y2 - y1 > 0.003) {
-          setSel((prev) => {
-            const next = { ...prev };
-            elsRef.current.forEach((el) => {
-              const g = toGeom(el);
-              const cx = g.punkt ? g.x : g.x + g.w / 2, cy = g.punkt ? g.y : g.y + g.h / 2;
-              if (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2) next[el.id] = true;
-            });
-            return next;
-          });
-        }
-      }
+      actions.current.pointerUp();
     };
 
     const onWheel = (e: WheelEvent) => {
@@ -478,12 +503,57 @@ export function GeometryEditor({ view, elements, types, reload }: { view: any; e
       window.removeEventListener("keyup", onKeyUp);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [snapOn, snapStep]);
+  }, []);
 
   const fit = () => {
     const { w, h } = stageSize.current;
     const s = Math.min(w / W, h / H) * 0.95;
     setTr({ s, tx: (w - W * s) / 2, ty: (h - H * s) / 2 });
+  };
+
+  const zoomBy = (k: number) => setTr((t0) => {
+    const s = Math.max(0.1, Math.min(8, t0.s * k)); const f = s / t0.s;
+    const mx = stageSize.current.w / 2, my = stageSize.current.h / 2;
+    return { s, tx: mx - f * (mx - t0.tx), ty: my - f * (my - t0.ty) };
+  });
+
+  // ---- native (tablet) touch layer: 1 finger = pointer core, 2 fingers = pinch/pan
+  const onTouchStart = (e: any) => {
+    if (modalOpenRef.current) return;
+    const ts = e.nativeEvent.touches;
+    if (ts.length >= 2) {
+      drag.current = null; resize.current = null; setMarquee(null); setDragDelta(null); setResizePrev(null);
+      const dx = ts[0].pageX - ts[1].pageX, dy = ts[0].pageY - ts[1].pageY;
+      pinch.current = { d0: Math.hypot(dx, dy) || 1, s0: trRef.current.s, mid: { x: (ts[0].pageX + ts[1].pageX) / 2, y: (ts[0].pageY + ts[1].pageY) / 2 }, tx0: trRef.current.tx, ty0: trRef.current.ty };
+      return;
+    }
+    actions.current.pointerDown(toRel(ts[0].pageX, ts[0].pageY), false);
+  };
+  const onTouchMove = (e: any) => {
+    const ts = e.nativeEvent.touches;
+    if (pinch.current && ts.length >= 2) {
+      const p = pinch.current;
+      const d = Math.hypot(ts[0].pageX - ts[1].pageX, ts[0].pageY - ts[1].pageY) || 1;
+      const mid = { x: (ts[0].pageX + ts[1].pageX) / 2, y: (ts[0].pageY + ts[1].pageY) / 2 };
+      const s = Math.max(0.1, Math.min(8, p.s0 * (d / p.d0)));
+      const f = s / p.s0;
+      const mx = p.mid.x - stagePos.current.px, my = p.mid.y - stagePos.current.py;
+      setTr({ s, tx: (mx - f * (mx - p.tx0)) + (mid.x - p.mid.x), ty: (my - f * (my - p.ty0)) + (mid.y - p.mid.y) });
+      return;
+    }
+    if (ts.length === 1 && !pinch.current) actions.current.pointerMove(toRel(ts[0].pageX, ts[0].pageY));
+  };
+  const onTouchEnd = (e: any) => {
+    if (e.nativeEvent.touches.length === 0) {
+      if (pinch.current) { pinch.current = null; return; }
+      actions.current.pointerUp();
+    }
+  };
+  const onStageLayout = () => {
+    const n: any = stageRef.current;
+    if (n?.measureInWindow) n.measureInWindow((x: number, y: number, w: number, h: number) => {
+      stagePos.current = { px: x, py: y }; stageSize.current = { w, h };
+    });
   };
   useEffect(() => { setTimeout(fit, 300); /* initial fit */
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -512,46 +582,61 @@ export function GeometryEditor({ view, elements, types, reload }: { view: any; e
 
   return (
     <View style={st.root}>
-      {/* toolbar */}
+      {/* toolbar — grouped, compact (icon-only) below 1100px, horizontal scroll as safety net */}
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={st.toolbar} contentContainerStyle={st.toolbarRow}>
-        <ToolBtn id="select" icon="hand-left-outline" label={t("tool_select")} active={tool === "select"} onSelect={selectTool} />
-        <ToolBtn id="punkt" icon="pin-outline" label={t("tool_point")} active={tool === "punkt"} onSelect={selectTool} />
-        <ToolBtn id="prostokat" icon="square-outline" label={t("tool_rect")} active={tool === "prostokat"} onSelect={selectTool} />
+        {/* tryby */}
+        <ToolBtn id="select" icon="hand-left-outline" label={t("tool_select")} active={tool === "select"} onSelect={selectTool} compact={compact} />
+        <ToolBtn id="punkt" icon="pin-outline" label={t("tool_point")} active={tool === "punkt"} onSelect={selectTool} compact={compact} />
+        <ToolBtn id="prostokat" icon="square-outline" label={t("tool_rect")} active={tool === "prostokat"} onSelect={selectTool} compact={compact} />
         <View style={st.sep} />
-        <ActBtn id="undo" icon="arrow-undo-outline" label="Ctrl+Z" onPress={undo} />
-        <ActBtn id="redo" icon="arrow-redo-outline" label="Ctrl+Y" onPress={redo} />
+        {/* historia */}
+        <ActBtn id="undo" icon="arrow-undo-outline" label="Ctrl+Z" onPress={undo} compact={compact} />
+        <ActBtn id="redo" icon="arrow-redo-outline" label="Ctrl+Y" onPress={redo} compact={compact} />
         <View style={st.sep} />
-        <ActBtn id="dup-grid" icon="grid-outline" label={t("dup_grid")} onPress={() => { setDup({ mode: "grid" }); setCollisions([]); }} disabled={selIds.length !== 1 || toGeom(selEls[0] || {}).punkt} />
-        <ActBtn id="dup-line" icon="ellipsis-horizontal-outline" label={t("dup_line")} onPress={() => { setDup({ mode: "line" }); setCollisions([]); }} disabled={selIds.length !== 1 || toGeom(selEls[0] || {}).punkt} />
+        {/* wyrównanie */}
+        <ActBtn id="al-left" icon="chevron-back-outline" label={t("align_left")} onPress={() => arrange("left")} disabled={selIds.length < 2} compact={compact} />
+        <ActBtn id="al-hc" icon="remove-outline" label={t("align_hcenter")} onPress={() => arrange("hcenter")} disabled={selIds.length < 2} compact={compact} />
+        <ActBtn id="al-right" icon="chevron-forward-outline" label={t("align_right")} onPress={() => arrange("right")} disabled={selIds.length < 2} compact={compact} />
+        <ActBtn id="al-top" icon="chevron-up-outline" label={t("align_top")} onPress={() => arrange("top")} disabled={selIds.length < 2} compact={compact} />
+        <ActBtn id="al-vc" icon="reorder-two-outline" label={t("align_vcenter")} onPress={() => arrange("vcenter")} disabled={selIds.length < 2} compact={compact} />
+        <ActBtn id="al-bottom" icon="chevron-down-outline" label={t("align_bottom")} onPress={() => arrange("bottom")} disabled={selIds.length < 2} compact={compact} />
         <View style={st.sep} />
-        <ActBtn id="al-left" icon="chevron-back-outline" label={t("align_left")} onPress={() => arrange("left")} disabled={selIds.length < 2} />
-        <ActBtn id="al-hc" icon="remove-outline" label={t("align_hcenter")} onPress={() => arrange("hcenter")} disabled={selIds.length < 2} />
-        <ActBtn id="al-right" icon="chevron-forward-outline" label={t("align_right")} onPress={() => arrange("right")} disabled={selIds.length < 2} />
-        <ActBtn id="al-top" icon="chevron-up-outline" label={t("align_top")} onPress={() => arrange("top")} disabled={selIds.length < 2} />
-        <ActBtn id="al-vc" icon="reorder-two-outline" label={t("align_vcenter")} onPress={() => arrange("vcenter")} disabled={selIds.length < 2} />
-        <ActBtn id="al-bottom" icon="chevron-down-outline" label={t("align_bottom")} onPress={() => arrange("bottom")} disabled={selIds.length < 2} />
-        <ActBtn id="dist-h" icon="swap-horizontal-outline" label={t("distribute_h")} onPress={() => arrange("disth")} disabled={selIds.length < 3} />
-        <ActBtn id="dist-v" icon="swap-vertical-outline" label={t("distribute_v")} onPress={() => arrange("distv")} disabled={selIds.length < 3} />
-        <ActBtn id="same-size" icon="resize-outline" label={t("same_size")} onPress={() => arrange("same")} disabled={selIds.length < 2} />
-        <ActBtn id="mirror-h" icon="repeat-outline" label={t("mirror_h")} onPress={() => arrange("mirrorh")} disabled={selIds.length < 1} />
-        <ActBtn id="mirror-v" icon="sync-outline" label={t("mirror_v")} onPress={() => arrange("mirrorv")} disabled={selIds.length < 1} />
+        {/* rozmieszczanie / lustro */}
+        <ActBtn id="dist-h" icon="swap-horizontal-outline" label={t("distribute_h")} onPress={() => arrange("disth")} disabled={selIds.length < 3} compact={compact} />
+        <ActBtn id="dist-v" icon="swap-vertical-outline" label={t("distribute_v")} onPress={() => arrange("distv")} disabled={selIds.length < 3} compact={compact} />
+        <ActBtn id="same-size" icon="resize-outline" label={t("same_size")} onPress={() => arrange("same")} disabled={selIds.length < 2} compact={compact} />
+        <ActBtn id="mirror-h" icon="repeat-outline" label={t("mirror_h")} onPress={() => arrange("mirrorh")} disabled={selIds.length < 1} compact={compact} />
+        <ActBtn id="mirror-v" icon="sync-outline" label={t("mirror_v")} onPress={() => arrange("mirrorv")} disabled={selIds.length < 1} compact={compact} />
         <View style={st.sep} />
-        <ActBtn id="edit-data" icon="create-outline" label={t("edit_data")} onPress={() => { const e = selEls[0]; setKod(e.kod); setTypId(e.typ_id); setOpis(e.opis || ""); setForm({ geom: toGeom(e), el: e }); }} disabled={selIds.length !== 1} />
-        <ActBtn id="delete" icon="trash-outline" label="Del" onPress={() => setDelOpen(true)} disabled={selIds.length < 1} />
+        {/* edycja */}
+        <ActBtn id="dup-grid" icon="grid-outline" label={t("dup_grid")} onPress={() => { setDup({ mode: "grid" }); setCollisions([]); }} disabled={selIds.length !== 1 || toGeom(selEls[0] || {}).punkt} compact={compact} />
+        <ActBtn id="dup-line" icon="ellipsis-horizontal-outline" label={t("dup_line")} onPress={() => { setDup({ mode: "line" }); setCollisions([]); }} disabled={selIds.length !== 1 || toGeom(selEls[0] || {}).punkt} compact={compact} />
+        <ActBtn id="edit-data" icon="create-outline" label={t("edit_data")} onPress={() => { const e = selEls[0]; setKod(e.kod); setTypId(e.typ_id); setOpis(e.opis || ""); setForm({ geom: toGeom(e), el: e }); }} disabled={selIds.length !== 1} compact={compact} />
+        <ActBtn id="delete" icon="trash-outline" label="Del" onPress={() => setDelOpen(true)} disabled={selIds.length < 1} compact={compact} />
         <View style={st.sep} />
+        {/* siatka */}
         <Pressable testID="snap-toggle" onPress={() => setSnapOn((v) => !v)} style={[st.toolBtn, snapOn && st.toolBtnOn]}>
           <Ionicons name="apps-outline" size={16} color={snapOn ? "#fff" : colors.onSurfaceSecondary} />
-          <Text style={[st.toolText, snapOn && { color: "#fff" }]}>{t("snap_grid")}</Text>
+          {!compact && <Text style={[st.toolText, snapOn && { color: "#fff" }]}>{t("snap_grid")}</Text>}
         </Pressable>
         <TextInput testID="snap-step" value={snapStep} onChangeText={setSnapStep} style={st.snapInput} keyboardType="numeric" />
         <Text style={st.toolText}>%</Text>
         <View style={st.sep} />
-        <ActBtn id="fit" icon="scan-outline" label={t("fit_screen")} onPress={fit} />
-        <ActBtn id="zoom100" icon="search-outline" label="100%" onPress={() => setTr({ s: 1, tx: 0, ty: 0 })} />
+        {/* widok */}
+        <ActBtn id="fit" icon="scan-outline" label={t("fit_screen")} onPress={fit} compact={compact} />
+        <ActBtn id="zoom100" icon="search-outline" label="100%" onPress={() => setTr({ s: 1, tx: 0, ty: 0 })} compact={compact} />
+        <ActBtn id="zoom-in" icon="add-outline" label={t("zoom_in")} onPress={() => zoomBy(1.25)} compact={compact} />
+        <ActBtn id="zoom-out" icon="remove-circle-outline" label={t("zoom_out")} onPress={() => zoomBy(1 / 1.25)} compact={compact} />
       </ScrollView>
 
       {/* stage */}
-      <View ref={stageRef} style={st.stage} testID="editor-stage">
+      <View
+        ref={stageRef}
+        style={st.stage}
+        testID="editor-stage"
+        onLayout={onStageLayout}
+        {...(Platform.OS !== "web" ? { onTouchStart, onTouchMove, onTouchEnd } : {})}
+      >
         <View style={[st.content, { width: W, height: H, transform: [{ translateX: tr.tx }, { translateY: tr.ty }, { scale: tr.s }], transformOrigin: "0 0" } as any]}>
           {imgError ? (
             <View style={[st.imgFallback, { width: W, height: H }]}>
@@ -674,20 +759,20 @@ function Field({ label, value, onChange, testID, numeric = true }: any) {
 
 // Top-level (stable identity) toolbar buttons — defining them inside the editor
 // would remount them on every mousemove render and break the press cycle.
-function ToolBtn({ id, icon, label, active, onSelect }: any) {
+function ToolBtn({ id, icon, label, active, onSelect, compact }: any) {
   return (
-    <Pressable testID={`tool-${id}`} onPress={() => onSelect(id)} style={[st.toolBtn, active && st.toolBtnOn]}>
+    <Pressable testID={`tool-${id}`} onPress={() => onSelect(id)} style={[st.toolBtn, active && st.toolBtnOn]} accessibilityLabel={label}>
       <Ionicons name={icon} size={16} color={active ? "#fff" : colors.onSurfaceSecondary} />
-      <Text style={[st.toolText, active && { color: "#fff" }]}>{label}</Text>
+      {!compact && <Text style={[st.toolText, active && { color: "#fff" }]}>{label}</Text>}
     </Pressable>
   );
 }
 
-function ActBtn({ id, icon, label, onPress, disabled }: any) {
+function ActBtn({ id, icon, label, onPress, disabled, compact }: any) {
   return (
-    <Pressable testID={`act-${id}`} onPress={onPress} disabled={disabled} style={[st.toolBtn, disabled && { opacity: 0.35 }]}>
+    <Pressable testID={`act-${id}`} onPress={onPress} disabled={disabled} style={[st.toolBtn, disabled && { opacity: 0.35 }]} accessibilityLabel={label}>
       <Ionicons name={icon} size={16} color={colors.onSurfaceSecondary} />
-      <Text style={st.toolText}>{label}</Text>
+      {!compact && <Text style={st.toolText}>{label}</Text>}
     </Pressable>
   );
 }

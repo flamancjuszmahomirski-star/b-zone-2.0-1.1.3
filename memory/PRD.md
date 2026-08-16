@@ -102,3 +102,10 @@ ODŁOŻONE (dedykowana tura, za duże/ryzykowne na resztę budżetu): D — wsp�
 - Naprawione po drodze: remount toolbara (komponenty w renderze), stale closures (actionsRef), natywny img-drag porywający mysz (preventDefault + pointerEvents none).
 - Testy: iter14 (backend 9/9, frontend PASS) + pomiary px 4 przepływów myszy. Dane testowe: projekt TEST_R2_EDITOR (2 widoki, PERF 200).
 - Sprawozdanie: /app/memory/SPRAWOZDANIE-RUNDA-2.md
+
+## Runda 2.1 (patch, app.json vc134) — DONE 2026-06 — edytor na tablecie + responsywny toolbar
+- BLOK 1: GeometryEditor dostępny gdy admin && (web z min. bokiem okna >=600dp LUB natywny tablet). Hook src/hooks/use-is-tablet.ts: expo-device getDeviceTypeAsync (TABLET), fallback shortestSide>=600dp. Telefon/nie-admin: bez zmian (niewidoczny).
+- Natywna warstwa dotyku w edytorze: wspólny rdzeń pointerDown/Move/Up (refaktor z DOM handlerów, zero zmian logiki), 1 palec = rysowanie/zaznaczanie/przesuwanie/uchwyty, 2 palce = pinch-zoom+pan; tolerancje trafień 24px na dotyku (>=48dp); DOM effect za guardem Platform.OS==="web".
+- BLOK 2: toolbar pogrupowany separatorami (tryby|historia|wyrównanie|rozmieszczenie/lustro|edycja|siatka|widok), compact (same ikony) przy szer. <1500px + poziomy scroll jako zabezpieczenie + przyciski Przybliż/Oddal (zoom_in/zoom_out w translations). Przy 1366px cały pasek widoczny bez scrolla.
+- Testy (preview): regresja web admin (2-klik, persist po refresh, ghost preview siatki, Ctrl+Z=1 krok), telefon-admin bez edytora, foreman bez edytora, toolbar 1366/1194/820.
+- UWAGA: natywny dotyk na fizycznym tablecie do potwierdzenia przez właściciela po buildzie (preview przeglądarkowe nie emuluje Platform.OS==='android').

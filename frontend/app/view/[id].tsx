@@ -2,7 +2,7 @@
 // ABSENT on the phone (no route, no mode, no entry) — it exists exclusively on
 // web for the admin role (GeometryEditor). Enforced also on the backend.
 import React, { useState, useCallback } from "react";
-import { View, Text, StyleSheet, Pressable, Modal, Dimensions, Platform } from "react-native";
+import { View, Text, StyleSheet, Pressable, Modal, Dimensions, Platform, useWindowDimensions } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Image } from "expo-image";
 import { Ionicons } from "@expo/vector-icons";
@@ -18,6 +18,7 @@ import { Button } from "@/src/components/Button";
 import { LoadingState } from "@/src/components/States";
 import { useToast } from "@/src/components/Toast";
 import { GeometryEditor } from "@/src/components/web/GeometryEditor";
+import { useIsTablet } from "@/src/hooks/use-is-tablet";
 
 const SCREEN = Dimensions.get("window");
 
@@ -61,8 +62,13 @@ export default function ViewCanvas() {
   const insets = useSafeAreaInsets();
   const toast = useToast();
   const canReceive = user?.rola === "admin" || user?.rola === "foreman";
-  // R2 (D): editor exists ONLY on web AND ONLY for admin.
-  const isWebAdmin = Platform.OS === "web" && user?.rola === "admin";
+  // R2.1 (BLOK 1): editor = admin AND (web with desktop/tablet-sized window OR native tablet).
+  // Phone (native or narrow web window) = preview only. Enforced also on the backend.
+  const isTablet = useIsTablet();
+  const { width: winW, height: winH } = useWindowDimensions();
+  const isWebAdmin = user?.rola === "admin" && (
+    Platform.OS === "web" ? Math.min(winW, winH) >= 600 : isTablet
+  );
 
   const [view, setView] = useState<any>(null);
   const [elements, setElements] = useState<any[]>([]);
